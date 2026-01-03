@@ -9,34 +9,56 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 import re
+from datetime import datetime
+import pickle
 
 logger = logging.getLogger(__name__)
 
-# Cooldown storage for download operations
+# Cooldown storage
 download_cooldowns: Dict[int, float] = {}
-# Cooldown storage for batch operations
 batch_cooldowns: Dict[int, float] = {}
+COOLDOWN_FILE = "cooldowns.pkl"
+
+def save_cooldowns():
+    """Save cooldowns to file"""
+    try:
+        with open(COOLDOWN_FILE, 'wb') as f:
+            pickle.dump({"download": download_cooldowns, "batch": batch_cooldowns}, f)
+    except Exception as e:
+        logger.error(f"Error saving cooldowns: {e}")
+
+def load_cooldowns():
+    """Load cooldowns from file"""
+    global download_cooldowns, batch_cooldowns
+    try:
+        if os.path.exists(COOLDOWN_FILE):
+            with open(COOLDOWN_FILE, 'rb') as f:
+                data = pickle.load(f)
+                download_cooldowns = data.get("download", {})
+                batch_cooldowns = data.get("batch", {})
+    except Exception as e:
+        logger.error(f"Error loading cooldowns: {e}")
 
 def create_download_directory(user_id: int, message_id: Optional[int] = None) -> Path:
     """Create download directory for user if it doesn't exist"""
     try:
         from config import DOWNLOAD_PATH
         
+        # Create main user directory
+        user_dir = Path(DOWNLOAD_PATH) / str(user_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(user_dir), 0o755)
+        
         if message_id:
-            # For batch downloads: downloads/{message_id}/
-            download_dir = Path("downloads") / str(message_id)
+            # Also create temporary directory for batch
+            temp_dir = Path("downloads") / str(message_id)
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(temp_dir), 0o755)
+            logger.info(f"Created directories: {user_dir}, {temp_dir}")
+            return temp_dir
         else:
-            # For direct downloads: /app/downloads/{user_id}/
-            download_dir = Path(DOWNLOAD_PATH) / str(user_id)
-        
-        download_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Set proper permissions
-        os.chmod(str(download_dir.parent), 0o755)
-        os.chmod(str(download_dir), 0o755)
-        
-        logger.info(f"Created/Verified directory: {download_dir}")
-        return download_dir
+            logger.info(f"Created user directory: {user_dir}")
+            return user_dir
     except Exception as e:
         logger.error(f"Failed to create directory for user {user_id}: {e}")
         raise
@@ -80,11 +102,14 @@ def set_cooldown(user_id: int, cooldown_type: str = "download"):
     """Set cooldown for user"""
     cooldown_dict = download_cooldowns if cooldown_type == "download" else batch_cooldowns
     cooldown_dict[user_id] = time.time()
+    save_cooldowns()
 
 def remove_cooldown(user_id: int, cooldown_type: str = "download"):
-    """Remove cooldown for user (if download fails)"""
+    """Remove cooldown for user"""
     cooldown_dict = download_cooldowns if cooldown_type == "download" else batch_cooldowns
-    cooldown_dict.pop(user_id, None)
+    if user_id in cooldown_dict:
+        del cooldown_dict[user_id]
+        save_cooldowns()
 
 async def cleanup_temp_directory(temp_dir: str, max_age_hours: int = 1):
     """Clean up old temporary files and directories"""
@@ -120,6 +145,9 @@ def check_file_size(file_size: int) -> bool:
     """Check if file size is within limits"""
     from config import MAX_DOWNLOAD_SIZE
     return file_size <= MAX_DOWNLOAD_SIZE
+
+# Load cooldowns on startup
+load_cooldowns()
 
 # Rexbots
 # Don't Remove Credit
