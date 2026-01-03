@@ -484,13 +484,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             
         logger.error(f"Error downloading media: {e}")
         
-        # Cleanup on error
+               # Cleanup on error
         if os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
             except:
-            pass
-                
+                pass
         if ERROR_MESSAGE:
             await client.send_message(
                 message.chat.id, 
