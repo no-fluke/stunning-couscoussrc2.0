@@ -1,15 +1,25 @@
 FROM python:3.12-slim
 
+# Install system dependencies including build tools
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    gnupg \
+    gcc \
+    g++ \
+    make \
+    build-essential \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Set working directory
 WORKDIR /app
 
 # Create necessary directories with proper permissions
 RUN mkdir -p \
     /app/downloads \
-    /app/downloads/temp \
     /app/thumbs \
     /app/logs \
-    /app/Rexbots \
     && chmod -R 755 /app
 
 # Set environment variables
@@ -26,27 +36,33 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# Clean up build dependencies (optional, to reduce image size)
+RUN apt-get purge -y \
+    gcc \
+    g++ \
+    make \
+    build-essential \
+    python3-dev \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy project files
 COPY . .
 
-# Create additional required directories from the code
-RUN mkdir -p /app/downloads \
-    && chmod 755 /app/downloads \
-    && mkdir -p /app/thumbs \
-    && chmod 755 /app/thumbs
+# Set proper permissions
+RUN chown -R 1001:1001 /app && \
+    chmod -R 755 /app
 
-# Check if Rexbots directory exists, if not create it
-RUN if [ ! -d "/app/Rexbots" ]; then mkdir -p /app/Rexbots; fi
+# Create a non-root user for security
+RUN useradd -m -u 1001 -s /bin/bash appuser && \
+    chown -R appuser:appuser /app
 
-# Set proper permissions for all created directories
-RUN find /app -type d -exec chmod 755 {} \; && \
-    find /app -type f -exec chmod 644 {} \; && \
-    chmod +x /app/*.py
+USER appuser
 
 # Expose port for Flask app
 EXPOSE 8080
 
-# Start both Flask app and Telegram bot
+# Start both services
 CMD gunicorn --bind 0.0.0.0:8080 --workers=2 --threads=4 --timeout 120 --access-logfile - --error-logfile - app:app & \
     python3 bot.py
 
