@@ -16,11 +16,13 @@ from pyrogram.errors import (
     InviteHashExpired, UsernameNotOccupied, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from config import API_ID, API_HASH, ERROR_MESSAGE
+from config import API_ID, API_HASH, ERROR_MESSAGE, COOLDOWN_SECONDS, MAX_DOWNLOAD_SIZE
 from database.db import db
 import math
 from Rexbots.strings import HELP_TXT, COMMANDS_TXT
 from logger import LOGGER
+from Rexbots.utils import is_on_cooldown, set_cooldown, remove_cooldown, safe_filename, create_download_directory, check_file_size
+from pathlib import Path
 
 def humanbytes(size):
     if not size:
@@ -205,14 +207,6 @@ async def send_start(client: Client, message: Message):
         parse_mode=enums.ParseMode.HTML
     )
 
-    # try:
-    #     await message.react(
-    #         emoji=random.choice(REACTIONS),
-    #         big=True
-    #     )
-    # except Exception as e:
-    #     print(f"Reaction failed: {e}")
-
 # -------------------
 # Help command (standalone)
 # -------------------
@@ -231,7 +225,33 @@ async def send_help(client: Client, message: Message):
 @Client.on_message(filters.command(["cancel"]))
 async def send_cancel(client: Client, message: Message):
     batch_temp.IS_BATCH[message.from_user.id] = True
+    remove_cooldown(message.from_user.id, "batch")
     await message.reply_text("❌ Batch Process Cancelled Successfully.")
+
+# -------------------
+# Cooldown command
+# -------------------
+
+@Client.on_message(filters.command("cooldown") & filters.private)
+async def check_cooldown_command(client: Client, message: Message):
+    """Check current cooldown status"""
+    user_id = message.from_user.id
+    
+    # Check both download and batch cooldowns
+    download_remaining = is_on_cooldown(user_id, "download")
+    batch_remaining = is_on_cooldown(user_id, "batch")
+    
+    if download_remaining or batch_remaining:
+        text = "⏳ **Cooldown Status:**\n\n"
+        if download_remaining:
+            text += f"• **Direct Downloads:** {int(download_remaining)} seconds remaining\n"
+        if batch_remaining:
+            text += f"• **Batch Downloads:** {int(batch_remaining)} seconds remaining\n"
+        text += f"\n⏰ **Cooldown period:** {COOLDOWN_SECONDS} seconds"
+    else:
+        text = "✅ **No Active Cooldowns**\n\nYou can start downloading now!\n⏰ Cooldown period: 30 seconds"
+    
+    await message.reply_text(text, quote=True)
 
 # -------------------
 # Handle incoming messages
@@ -239,6 +259,18 @@ async def send_cancel(client: Client, message: Message):
 
 @Client.on_message(filters.text & filters.private & ~filters.regex("^/"))
 async def save(client: Client, message: Message):
+    user_id = message.from_user.id
+    
+    # Check cooldown
+    cooldown_remaining = is_on_cooldown(user_id, "batch")
+    if cooldown_remaining:
+        await message.reply_text(
+            f"⏳ Please wait {int(cooldown_remaining)} seconds before starting another download.\n"
+            f"Cooldown: {COOLDOWN_SECONDS} seconds",
+            quote=True
+        )
+        return
+    
     if "https://t.me/" in message.text:
         if batch_temp.IS_BATCH.get(message.from_user.id) == False:
             return await message.reply_text(
@@ -254,6 +286,8 @@ async def save(client: Client, message: Message):
             toID = fromID
 
         batch_temp.IS_BATCH[message.from_user.id] = False
+        # Set cooldown at start
+        set_cooldown(user_id, "batch")
 
         is_private = "https://t.me/c/" in message.text
         is_batch = "https://t.me/b/" in message.text
@@ -279,6 +313,7 @@ async def save(client: Client, message: Message):
             if user_data is None:
                 await message.reply("**__For Downloading Restricted Content You Have To /login First.__**")
                 batch_temp.IS_BATCH[message.from_user.id] = True
+                remove_cooldown(user_id, "batch")
                 return
 
             # 3. Connect User Client
@@ -287,17 +322,19 @@ async def save(client: Client, message: Message):
                 await acc.connect()
             except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
                 batch_temp.IS_BATCH[message.from_user.id] = True
+                remove_cooldown(user_id, "batch")
                 await db.set_session(message.from_user.id, None)
                 return await message.reply(f"**__Your Login Session Invalid/Expired. Please /login again.__**\nError: {e}")
             except Exception:
                 batch_temp.IS_BATCH[message.from_user.id] = True
+                remove_cooldown(user_id, "batch")
                 return await message.reply("**__Your Login Session Error. So /logout First Then Login Again By - /login__**")
 
             # 4. Handle Content
             if is_private:
                 chatid = int("-100" + datas[4])
                 try:
-                    await handle_private(client, acc, message, chatid, msgid)
+                    await handle_private(client, acc, message, chatid, msgid, user_id)
                 except Exception as e:
                     logger.error(f"Error handling private chat: {e}")
                     if ERROR_MESSAGE:
@@ -306,7 +343,7 @@ async def save(client: Client, message: Message):
             elif is_batch:
                 username = datas[4]
                 try:
-                    await handle_private(client, acc, message, username, msgid)
+                    await handle_private(client, acc, message, username, msgid, user_id)
                 except Exception as e:
                     logger.error(f"Error handling batch channel: {e}")
                     if ERROR_MESSAGE:
@@ -316,7 +353,7 @@ async def save(client: Client, message: Message):
                 # Restricted Public Channel
                 username = datas[3]
                 try:
-                    await handle_private(client, acc, message, username, msgid)
+                    await handle_private(client, acc, message, username, msgid, user_id)
                 except Exception as e:
                     logger.error(f"Error copy/handle private: {e}")
                     if ERROR_MESSAGE:
@@ -325,12 +362,13 @@ async def save(client: Client, message: Message):
             await asyncio.sleep(3)
 
         batch_temp.IS_BATCH[message.from_user.id] = True
+        # Note: Cooldown remains active for the full period
 
 # -------------------
 # Handle private content
 # -------------------
 
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int, user_id: int):
     try:
         msg: Message = await acc.get_messages(chatid, msgid)
     except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
@@ -355,9 +393,6 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         except Exception as e2:
             logger.error(f"Retry failed: {e2}")
             return
-# Rexbots
-# Don't Remove Credit
-# Telegram Channel @RexBots_Official
 
     if msg.empty:
         return
@@ -382,14 +417,33 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                                           parse_mode=enums.ParseMode.HTML)
             return
 
+    # Check for media file size
+    try:
+        if msg.document and msg.document.file_size:
+            if not check_file_size(msg.document.file_size):
+                await client.send_message(
+                    message.chat.id,
+                    f"❌ File too large! Max size: {MAX_DOWNLOAD_SIZE // (1024*1024*1024)}GB",
+                    reply_to_message_id=message.id
+                )
+                return
+    except:
+        pass
+
     smsg = await client.send_message(message.chat.id, '**__Downloading 🚀__**', reply_to_message_id=message.id)
     
     # ----------------------------------------
     # Create unique temp directory for this task
     # ----------------------------------------
     temp_dir = f"downloads/{message.id}"
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
+    
+    # FIX: Use the utility function to create directory
+    create_download_directory(user_id, message.id)
+    
+    # Also create the specific temp directory
+    temp_path = Path(temp_dir)
+    temp_path.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(temp_path), 0o755)
 
     try:
         asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
@@ -397,12 +451,19 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         logger.error(f"Error creating download status task: {e}")
         
     try:
-        # Download into unique directory (folder path must end with / for Pyrogram)
-        file = await acc.download_media(msg, file_name=f"{temp_dir}/", progress=progress, progress_args=[message, "down"])
+        # Download into unique directory
+        file = await acc.download_media(
+            msg, 
+            file_name=f"{temp_dir}/", 
+            progress=progress, 
+            progress_args=[message, "down"]
+        )
+        
         if os.path.exists(f'{message.id}downstatus.txt'):
             os.remove(f'{message.id}downstatus.txt')
+            
     except Exception as e:
-        # Check if cancelled (flag is True) or exception message contains "Cancelled"
+        # Check if cancelled
         if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
             if os.path.exists(f'{message.id}downstatus.txt'):
                 try:
@@ -410,7 +471,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 except:
                     pass
             
-            # Robust Cleanup: Delete the entire temp directory
+            # Clean up temp directory
             if os.path.exists(temp_dir):
                 try:
                     shutil.rmtree(temp_dir)
@@ -429,8 +490,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 pass
                 
         if ERROR_MESSAGE:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
-                                      parse_mode=enums.ParseMode.HTML)
+            await client.send_message(
+                message.chat.id, 
+                f"Error: {e}", 
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML
+            )
         return await smsg.delete()
 
     if batch_temp.IS_BATCH.get(message.from_user.id):
@@ -446,10 +511,11 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
     except Exception as e:
         logger.error(f"Error creating upload status task: {e}")
+        
     caption = msg.caption if msg.caption else None
     
     if batch_temp.IS_BATCH.get(message.from_user.id):
-         # Cleanup if cancelled during gap
+        # Cleanup if cancelled during gap
         if os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
@@ -459,13 +525,26 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     try:
         if "Document" == msg_type:
+            # Get safe filename
+            original_filename = msg.document.file_name if msg.document.file_name else f"document_{msgid}.bin"
+            safe_name = safe_filename(original_filename)
+            
             try:
                 ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
             except:
                 ph_path = None
-            await client.send_document(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id,
-                                       parse_mode=enums.ParseMode.HTML, progress=progress,
-                                       progress_args=[message, "up"])
+                
+            await client.send_document(
+                chat, 
+                file, 
+                thumb=ph_path, 
+                caption=caption, 
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML, 
+                progress=progress,
+                progress_args=[message, "up"]
+            )
+            
             if ph_path and os.path.exists(ph_path):
                 os.remove(ph_path)
 
@@ -474,10 +553,21 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
             except:
                 ph_path = None
-            await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width,
-                                    height=msg.video.height, thumb=ph_path, caption=caption,
-                                    reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML,
-                                    progress=progress, progress_args=[message, "up"])
+                
+            await client.send_video(
+                chat, 
+                file, 
+                duration=msg.video.duration, 
+                width=msg.video.width,
+                height=msg.video.height, 
+                thumb=ph_path, 
+                caption=caption,
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress, 
+                progress_args=[message, "up"]
+            )
+            
             if ph_path and os.path.exists(ph_path):
                 os.remove(ph_path)
 
@@ -488,26 +578,48 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             await client.send_sticker(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
 
         elif "Voice" == msg_type:
-            await client.send_voice(chat, file, caption=caption, caption_entities=msg.caption_entities,
-                                    reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML,
-                                    progress=progress, progress_args=[message, "up"])
+            await client.send_voice(
+                chat, 
+                file, 
+                caption=caption, 
+                caption_entities=msg.caption_entities,
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress, 
+                progress_args=[message, "up"]
+            )
 
         elif "Audio" == msg_type:
             try:
                 ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
             except:
                 ph_path = None
-            await client.send_audio(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id,
-                                    parse_mode=enums.ParseMode.HTML, progress=progress,
-                                    progress_args=[message, "up"])
+                
+            await client.send_audio(
+                chat, 
+                file, 
+                thumb=ph_path, 
+                caption=caption, 
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML, 
+                progress=progress,
+                progress_args=[message, "up"]
+            )
+            
             if ph_path and os.path.exists(ph_path):
                 os.remove(ph_path)
 
         elif "Photo" == msg_type:
-            await client.send_photo(chat, file, caption=caption, reply_to_message_id=message.id,
-                                    parse_mode=enums.ParseMode.HTML)
+            await client.send_photo(
+                chat, 
+                file, 
+                caption=caption, 
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML
+            )
+            
     except Exception as e:
-        # Check if cancelled (flag is True) or exception message contains "Cancelled"
+        # Check if cancelled
         if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
             if os.path.exists(f'{message.id}upstatus.txt'):
                 try:
@@ -515,7 +627,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 except:
                     pass
             
-            # Robust Cleanup: Delete the entire temp directory
+            # Clean up temp directory
             if os.path.exists(temp_dir):
                 try:
                     shutil.rmtree(temp_dir)
@@ -525,8 +637,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
         logger.error(f"Error sending media: {e}")
         if ERROR_MESSAGE:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
-                                      parse_mode=enums.ParseMode.HTML)
+            await client.send_message(
+                message.chat.id, 
+                f"Error: {e}", 
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML
+            )
 
     if os.path.exists(f'{message.id}upstatus.txt'):
         os.remove(f'{message.id}upstatus.txt')
