@@ -89,9 +89,9 @@ async def downstatus(client, statusfile, message, chat):
             with open(statusfile, "r", encoding='utf-8') as downread:
                 txt = downread.read()
             await client.edit_message_text(chat, message.id, f"📥 **Downloading...**\n\n{txt}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)  # Changed from 10 to 30 seconds
         except:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)  # Changed from 5 to 10 seconds
 
 # -------------------
 # Upload status
@@ -105,9 +105,9 @@ async def upstatus(client, statusfile, message, chat):
             with open(statusfile, "r", encoding='utf-8') as upread:
                 txt = upread.read()
             await client.edit_message_text(chat, message.id, f"📤 **Uploading...**\n\n{txt}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)  # Changed from 10 to 30 seconds
         except:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)  # Changed from 5 to 10 seconds
 
 # -------------------
 # Progress writer
@@ -132,8 +132,8 @@ def progress(current, total, message, type):
     if task_id not in progress.start_time:
         progress.start_time[task_id] = now
         
-    # Update only every 3 seconds or if completed
-    if (now - last_time) > 3 or current == total:
+    # Update only every 10 seconds or if completed  # Changed from 3 to 10
+    if (now - last_time) > 10 or current == total:  # Changed from 3 to 10
         try:
             percentage = current * 100 / total
             speed = current / (now - progress.start_time[task_id])
@@ -359,13 +359,14 @@ async def save(client: Client, message: Message):
                     if ERROR_MESSAGE:
                          await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
-            await asyncio.sleep(3)
+            # Wait 30 seconds before next file
+            await asyncio.sleep(30)
 
         batch_temp.IS_BATCH[message.from_user.id] = True
         # Note: Cooldown remains active for the full period
 
 # -------------------
-# Handle private content
+# Handle private content (FIXED VERSION)
 # -------------------
 
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int, user_id: int):
@@ -377,8 +378,6 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         await client.send_message(message.chat.id, f"Session Token Invalid/Expired. Please /login again.\nError: {e}")
         return
     except Exception as e:
-        # Handle PeerIdInvalid (which might come as generic Exception or RPCError)
-        # We try to refresh dialogs to learn about the peer.
         logger.warning(f"Error fetching message: {e}. Refreshing dialogs...")
         try:
             async for dialog in acc.get_dialogs(limit=None):
@@ -433,14 +432,17 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     smsg = await client.send_message(message.chat.id, '**__Downloading 🚀__**', reply_to_message_id=message.id)
     
     # ----------------------------------------
-    # Create unique temp directory for this task
+    # Create ALL necessary directories
     # ----------------------------------------
     temp_dir = f"downloads/{message.id}"
     
-    # FIX: Use the utility function to create directory
-    create_download_directory(user_id, message.id)
+    # FIX 1: Create user's personal download directory
+    from config import DOWNLOAD_PATH
+    user_dir = Path(DOWNLOAD_PATH) / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(user_dir), 0o755)
     
-    # Also create the specific temp directory
+    # FIX 2: Create temp directory for this batch
     temp_path = Path(temp_dir)
     temp_path.mkdir(parents=True, exist_ok=True)
     os.chmod(str(temp_path), 0o755)
@@ -451,7 +453,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         logger.error(f"Error creating download status task: {e}")
         
     try:
-        # Download into unique directory
+        # Download into temp directory
         file = await acc.download_media(
             msg, 
             file_name=f"{temp_dir}/", 
@@ -487,7 +489,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             try:
                 shutil.rmtree(temp_dir)
             except:
-                pass
+            pass
                 
         if ERROR_MESSAGE:
             await client.send_message(
@@ -506,6 +508,19 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             except:
                 pass
         return
+
+    # FIX 3: Wait 30 seconds between download and upload
+    await asyncio.sleep(30)
+    
+    # Update status message
+    try:
+        await client.edit_message_text(
+            message.chat.id,
+            smsg.id,
+            f"⏳ **Processing...**\n\nWaiting before upload..."
+        )
+    except:
+        pass
 
     try:
         asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
