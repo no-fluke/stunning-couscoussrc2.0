@@ -17,3 +17,9 @@ itsdangerous==2.0.1
 
 # --- Additional Dependencies ---
 pathlib2==2.3.7.post1
+
+# --- File Handling ---
+pyyaml==6.0.1
+
+# --- For Docker Health Checks ---
+requests==2.31.0
